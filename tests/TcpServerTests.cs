@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging.Abstractions;
 using server;
+using server.Enums;
 
 namespace tests;
 

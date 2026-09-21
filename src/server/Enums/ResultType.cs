@@ -1,9 +1,7 @@
-namespace server;
+namespace server.Enums;
 
 public enum ResultType
 {
-    Value = 1,
-    Success = 2,
-    NotFound = 3,
-    Error = 4,
+    Success = 1,
+    Error = 2,
 }

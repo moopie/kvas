@@ -1,3 +1,5 @@
+using server.Interfaces;
+
 namespace server;
 
 public sealed class CacheStore : ICacheStore

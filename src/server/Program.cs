@@ -1,5 +1,7 @@
 using System.Net;
 using server;
+using server.Enums;
+using server.Interfaces;
 
 var builder = Host.CreateApplicationBuilder(args);
 builder.Services.AddKeyedSingleton<ICacheStore, CacheStore>("primary");
