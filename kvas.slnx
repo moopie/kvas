@@ -2,4 +2,5 @@
   <Folder Name="/src/">
     <Project Path="src/server/server.csproj" />
   </Folder>
+  <Project Path="tests/tests.csproj" />
 </Solution>
