@@ -1,12 +1,12 @@
 namespace server;
 
-public sealed class Worker(ITcpServer server, ILogger<Worker> logger) : BackgroundService
+public sealed class Worker(IEnumerable<ITcpServer> servers, ILogger<Worker> logger) : BackgroundService
 {
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
         {
-            await server.Start(stoppingToken);
+            await Task.WhenAll(servers.Select(server => server.Start(stoppingToken)));
         }
         catch (Exception e)
         {

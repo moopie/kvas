@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -13,11 +14,16 @@ public sealed class TcpServer : ITcpServer
     public static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(2);
 
     private readonly TcpListener _listener;
+    private readonly TcpListener? _replicationListener;
+    private readonly IPEndPoint? _replicationEndPoint;
     private readonly ICacheStore _cacheStore;
     private readonly ILogger<TcpServer> _logger;
     private readonly SemaphoreSlim _connectionSlots;
     private readonly TimeSpan _connectionTimeout;
     private readonly ServerRole _role;
+    private readonly SemaphoreSlim _writeLock = new(1, 1);
+    private readonly ConcurrentDictionary<long, TcpClient> _replicas = new();
+    private long _nextReplicaId;
     
     private const int HeaderSize = sizeof(int);
     private const int MaxFrameSize = 2 * 1024;
@@ -37,7 +43,8 @@ public sealed class TcpServer : ITcpServer
         ILogger<TcpServer> logger,
         int maxConnections = DefaultMaxConnections,
         TimeSpan? connectionTimeout = null,
-        ServerRole role = ServerRole.Primary)
+        ServerRole role = ServerRole.Primary,
+        IPEndPoint? replicationEndPoint = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
 
@@ -58,6 +65,10 @@ public sealed class TcpServer : ITcpServer
         }
 
         _listener = new TcpListener(endPoint);
+        _replicationListener = role == ServerRole.Primary && replicationEndPoint is not null
+            ? new TcpListener(replicationEndPoint)
+            : null;
+        _replicationEndPoint = replicationEndPoint;
         _connectionSlots = new SemaphoreSlim(maxConnections, maxConnections);
         _role = role;
         _cacheStore = cacheStore;
@@ -68,6 +79,20 @@ public sealed class TcpServer : ITcpServer
     {
         _listener.Start();
         _logger.LogInformation("TCP server started on {EndPoint} as {Role}", _listener.LocalEndpoint, _role);
+        Task? replicationTask = null;
+
+        if (_replicationListener is not null)
+        {
+            _replicationListener.Start();
+            _logger.LogInformation(
+                "Replication listener started on {EndPoint}",
+                _replicationListener.LocalEndpoint);
+            replicationTask = AcceptReplicasAsync(stoppingToken);
+        }
+        else if (_role == ServerRole.Replica && _replicationEndPoint is not null)
+        {
+            replicationTask = ConsumeReplicationEventsAsync(stoppingToken);
+        }
         
         try
         {
@@ -90,6 +115,114 @@ public sealed class TcpServer : ITcpServer
         finally
         {
             _listener.Stop();
+            _replicationListener?.Stop();
+
+            foreach (var replica in _replicas.Values)
+            {
+                replica.Dispose();
+            }
+
+            _replicas.Clear();
+
+            if (replicationTask is not null)
+            {
+                await replicationTask;
+            }
+        }
+    }
+
+    private async Task ConsumeReplicationEventsAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                using var primary = new TcpClient();
+                await primary.ConnectAsync(_replicationEndPoint!, stoppingToken);
+                _logger.LogInformation(
+                    "Replica on {EndPoint} connected to primary replication endpoint {PrimaryEndPoint}",
+                    _listener.LocalEndpoint,
+                    _replicationEndPoint);
+
+                var stream = primary.GetStream();
+                while (!stoppingToken.IsCancellationRequested)
+                {
+                    var request = await ReadFrameAsync(stream, stoppingToken);
+                    await ApplyReplicationEventAsync(request);
+                }
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception e)
+            {
+                _logger.LogWarning(
+                    e,
+                    "Replica on {EndPoint} lost its primary connection; reconnecting",
+                    _listener.LocalEndpoint);
+
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    private async Task ApplyReplicationEventAsync(FrameRequest request)
+    {
+        switch (request.Command)
+        {
+            case CommandType.Set:
+                ArgumentException.ThrowIfNullOrEmpty(request.Value);
+                await _cacheStore.SetAsync(request.Key, request.Value);
+                break;
+            case CommandType.Delete:
+                try
+                {
+                    await _cacheStore.RemoveAsync(request.Key);
+                }
+                catch (KeyNotFoundException)
+                {
+                    // The desired replicated state is already present.
+                }
+                break;
+            default:
+                throw new InvalidDataException(
+                    $"Command {request.Command} is not a replication event.");
+        }
+    }
+
+    private async Task AcceptReplicasAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            try
+            {
+                var replica = await _replicationListener!.AcceptTcpClientAsync(stoppingToken);
+                var replicaId = Interlocked.Increment(ref _nextReplicaId);
+                _replicas[replicaId] = replica;
+                _logger.LogInformation(
+                    "Replica {ReplicaId} connected from {RemoteEndPoint}",
+                    replicaId,
+                    replica.Client.RemoteEndPoint);
+            }
+            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            {
+                break;
+            }
+            catch (Exception e)
+            {
+                if (!stoppingToken.IsCancellationRequested)
+                {
+                    _logger.LogError(e, "Error accepting replica connection");
+                }
+            }
         }
     }
 
@@ -152,9 +285,18 @@ public sealed class TcpServer : ITcpServer
     private async Task<FrameResponse> HandleDelete(FrameRequest request, CancellationToken token)
     {
         ArgumentException.ThrowIfNullOrEmpty(request.Key);
-        
-        await _cacheStore.RemoveAsync(request.Key);
-        return new FrameResponse(ResultType.Success, request.Key);
+
+        await _writeLock.WaitAsync(token);
+        try
+        {
+            await _cacheStore.RemoveAsync(request.Key);
+            await ReplicateWriteAsync(request, token);
+            return new FrameResponse(ResultType.Success, request.Key);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
     }
 
     private async Task<FrameResponse> HandleSet(FrameRequest request, CancellationToken token)
@@ -162,9 +304,37 @@ public sealed class TcpServer : ITcpServer
         ArgumentException.ThrowIfNullOrEmpty(request.Key);
         ArgumentException.ThrowIfNullOrEmpty(request.Value);
 
-        await _cacheStore.SetAsync(request.Key, request.Value);
-        
-        return new FrameResponse(ResultType.Success, request.Key);
+        await _writeLock.WaitAsync(token);
+        try
+        {
+            await _cacheStore.SetAsync(request.Key, request.Value);
+            await ReplicateWriteAsync(request, token);
+            return new FrameResponse(ResultType.Success, request.Key);
+        }
+        finally
+        {
+            _writeLock.Release();
+        }
+    }
+
+    private async Task ReplicateWriteAsync(FrameRequest request, CancellationToken token)
+    {
+        foreach (var (replicaId, replica) in _replicas)
+        {
+            try
+            {
+                await WriteFrameAsync(replica.GetStream(), request, token);
+            }
+            catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
+            {
+                if (_replicas.TryRemove(replicaId, out var disconnectedReplica))
+                {
+                    disconnectedReplica.Dispose();
+                }
+
+                _logger.LogWarning(e, "Replica {ReplicaId} disconnected", replicaId);
+            }
+        }
     }
 
     private async Task<FrameResponse> HandleGet(FrameRequest request, CancellationToken token)
