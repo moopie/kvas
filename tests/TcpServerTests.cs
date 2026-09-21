@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Microsoft.Extensions.Logging.Abstractions;
 using server;
 
 namespace tests;
@@ -26,7 +27,7 @@ public class TcpServerTests
     {
         var port = GetAvailablePort();
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var server = new TcpServer(new IPEndPoint(IPAddress.Loopback, port));
+        var server = CreateServer(port);
         var serverTask = server.Start(cancellation.Token);
 
         try
@@ -56,10 +57,7 @@ public class TcpServerTests
         var port = GetAvailablePort();
         var connectionTimeout = TimeSpan.FromMilliseconds(300);
         using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var server = new TcpServer(
-            new IPEndPoint(IPAddress.Loopback, port),
-            maxConnections: 1,
-            connectionTimeout);
+        var server = CreateServer(port, maxConnections: 1, connectionTimeout);
         var serverTask = server.Start(cancellation.Token);
 
         try
@@ -118,6 +116,19 @@ public class TcpServerTests
 
         return JsonSerializer.Deserialize<FrameResponse>(responsePayload, JsonOptions)
             ?? throw new InvalidDataException("The server returned an invalid response.");
+    }
+
+    private static TcpServer CreateServer(
+        int port,
+        int maxConnections = TcpServer.DefaultMaxConnections,
+        TimeSpan? connectionTimeout = null)
+    {
+        return new TcpServer(
+            new IPEndPoint(IPAddress.Loopback, port),
+            new CacheStore(),
+            NullLogger<TcpServer>.Instance,
+            maxConnections,
+            connectionTimeout);
     }
 
     private static int GetAvailablePort()

@@ -7,15 +7,17 @@ using System.Text.Json.Serialization;
 
 namespace server;
 
-public class TcpServer
+public sealed class TcpServer : ITcpServer
 {
     public const int DefaultMaxConnections = 128;
     public static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(2);
 
     private readonly TcpListener _listener;
-    private readonly CacheStore _cacheStore = new();
+    private readonly ICacheStore _cacheStore;
+    private readonly ILogger<TcpServer> _logger;
     private readonly SemaphoreSlim _connectionSlots;
     private readonly TimeSpan _connectionTimeout;
+    private readonly ServerRole _role;
     
     private const int HeaderSize = sizeof(int);
     private const int MaxFrameSize = 2 * 1024;
@@ -31,10 +33,21 @@ public class TcpServer
 
     public TcpServer(
         IPEndPoint endPoint,
+        ICacheStore cacheStore,
+        ILogger<TcpServer> logger,
         int maxConnections = DefaultMaxConnections,
-        TimeSpan? connectionTimeout = null)
+        TimeSpan? connectionTimeout = null,
+        ServerRole role = ServerRole.Primary)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
+
+        if (!Enum.IsDefined(role))
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(role),
+                role,
+                "Unknown server role.");
+        }
 
         _connectionTimeout = connectionTimeout ?? DefaultConnectionTimeout;
         if (_connectionTimeout <= TimeSpan.Zero)
@@ -46,11 +59,15 @@ public class TcpServer
 
         _listener = new TcpListener(endPoint);
         _connectionSlots = new SemaphoreSlim(maxConnections, maxConnections);
+        _role = role;
+        _cacheStore = cacheStore;
+        _logger = logger;
     }
 
     public async Task Start(CancellationToken stoppingToken)
     {
         _listener.Start();
+        _logger.LogInformation("TCP server started on {EndPoint} as {Role}", _listener.LocalEndpoint, _role);
         
         try
         {
@@ -58,8 +75,6 @@ public class TcpServer
             {
                 try
                 {
-                    //logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
-
                     var client = await _listener.AcceptTcpClientAsync(stoppingToken);
                     _ = HandleClientAsync(client, stoppingToken);
                 }
@@ -67,7 +82,7 @@ public class TcpServer
                 {
                     if (!stoppingToken.IsCancellationRequested)
                     {
-                        //logger.LogError(e, "Error");
+                        _logger.LogError(e, "Error accepting TCP connection");
                     }
                 }
             }
@@ -82,6 +97,7 @@ public class TcpServer
     {
         if (!_connectionSlots.Wait(0))
         {
+            _logger.LogWarning("Connection rejected because the connection pool is full");
             client.Dispose();
             return;
         }
@@ -95,7 +111,7 @@ public class TcpServer
                 var stream = client.GetStream();
                 var request = await ReadFrameAsync(stream, timeout.Token);
                 var response = await HandleRequest(request, timeout.Token);
-                //logger.LogInformation("[msg] {msg}", request);
+                _logger.LogInformation("[msg] {@Message}", request);
 
                 await WriteFrameAsync(stream, response, timeout.Token);
             }
@@ -107,7 +123,7 @@ public class TcpServer
             // because i don't want the handler to block other connections
             if (!stoppingToken.IsCancellationRequested)
             {
-                //logger.LogError(e, "listener error.");
+                _logger.LogError(e, "TCP client handler failed");
             }
         }
         finally
@@ -119,6 +135,11 @@ public class TcpServer
 
     private async Task<FrameResponse> HandleRequest(FrameRequest request, CancellationToken token)
     {
+        if (_role == ServerRole.Replica && request.Command is CommandType.Set or CommandType.Delete)
+        {
+            return new FrameResponse(ResultType.Error, "Writes are not allowed on a replica.");
+        }
+
         return request.Command switch
         {
             CommandType.Get => await HandleGet(request, token),

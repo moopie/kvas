@@ -1,6 +1,6 @@
 namespace server;
 
-public class CacheStore
+public sealed class CacheStore : ICacheStore
 {
     private readonly SemaphoreSlim _semaphore = new(1, 1);
     
