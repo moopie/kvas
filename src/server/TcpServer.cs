@@ -7,10 +7,15 @@ using System.Text.Json.Serialization;
 
 namespace server;
 
-public class TcpServer(IPEndPoint endPoint)
+public class TcpServer
 {
-    private readonly TcpListener _listener = new(endPoint);
+    public const int DefaultMaxConnections = 128;
+    public static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(2);
+
+    private readonly TcpListener _listener;
     private readonly CacheStore _cacheStore = new();
+    private readonly SemaphoreSlim _connectionSlots;
+    private readonly TimeSpan _connectionTimeout;
     
     private const int HeaderSize = sizeof(int);
     private const int MaxFrameSize = 2 * 1024;
@@ -23,6 +28,25 @@ public class TcpServer(IPEndPoint endPoint)
             new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)
         }
     };
+
+    public TcpServer(
+        IPEndPoint endPoint,
+        int maxConnections = DefaultMaxConnections,
+        TimeSpan? connectionTimeout = null)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxConnections, 1);
+
+        _connectionTimeout = connectionTimeout ?? DefaultConnectionTimeout;
+        if (_connectionTimeout <= TimeSpan.Zero)
+        {
+            throw new ArgumentOutOfRangeException(
+                nameof(connectionTimeout),
+                "Connection timeout must be greater than zero.");
+        }
+
+        _listener = new TcpListener(endPoint);
+        _connectionSlots = new SemaphoreSlim(maxConnections, maxConnections);
+    }
 
     public async Task Start(CancellationToken stoppingToken)
     {
@@ -53,31 +77,43 @@ public class TcpServer(IPEndPoint endPoint)
             _listener.Stop();
         }
     }
-    
-    private async Task HandleClientAsync(TcpClient client, CancellationToken token)
+
+    private async Task HandleClientAsync(TcpClient client, CancellationToken stoppingToken)
     {
-        using (client)
+        if (!_connectionSlots.Wait(0))
         {
-            try
+            client.Dispose();
+            return;
+        }
+
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            timeout.CancelAfter(_connectionTimeout);
+            using (client)
             {
-                //logger.LogInformation("Worker running at: {time}", DateTimeOffset.Now);
                 var stream = client.GetStream();
-                var request = await ReadFrameAsync(stream, token);
-                var response = await HandleRequest(request, token);
+                var request = await ReadFrameAsync(stream, timeout.Token);
+                var response = await HandleRequest(request, timeout.Token);
                 //logger.LogInformation("[msg] {msg}", request);
 
-                await WriteFrameAsync(stream, response, token);
+                await WriteFrameAsync(stream, response, timeout.Token);
             }
-            catch (OperationCanceledException) {}
-            catch (Exception e)
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception e)
+        {
+            // exceptions don't propagate further
+            // because i don't want the handler to block other connections
+            if (!stoppingToken.IsCancellationRequested)
             {
-                // exceptions don't propagate further
-                // because i don't want the handler to block other connections
-                if (!token.IsCancellationRequested)
-                {
-                    //logger.LogError(e, "listener error.");
-                }
+                //logger.LogError(e, "listener error.");
             }
+        }
+        finally
+        {
+            client.Dispose();
+            _connectionSlots.Release();
         }
     }
 

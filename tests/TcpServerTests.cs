@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text.Json;
@@ -41,6 +42,52 @@ public class TcpServerTests
 
             Assert.Equal(new FrameResponse(ResultType.Success, "greeting"), setResponse);
             Assert.Equal(new FrameResponse(ResultType.Success, "hello"), getResponse);
+        }
+        finally
+        {
+            await cancellation.CancelAsync();
+            await serverTask;
+        }
+    }
+
+    [Fact]
+    public async Task Server_LimitsConcurrentConnectionsAndTimesThemOut()
+    {
+        var port = GetAvailablePort();
+        var connectionTimeout = TimeSpan.FromMilliseconds(300);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var server = new TcpServer(
+            new IPEndPoint(IPAddress.Loopback, port),
+            maxConnections: 1,
+            connectionTimeout);
+        var serverTask = server.Start(cancellation.Token);
+
+        try
+        {
+            using var stalledClient = new TcpClient();
+            await stalledClient.ConnectAsync(IPAddress.Loopback, port, cancellation.Token);
+            await Task.Delay(50, cancellation.Token);
+
+            var stopwatch = Stopwatch.StartNew();
+            await Assert.ThrowsAnyAsync<IOException>(() => SendAsync(
+                port,
+                new FrameRequest(CommandType.Set, "rejected", "connection"),
+                cancellation.Token));
+            stopwatch.Stop();
+
+            Assert.True(
+                stopwatch.Elapsed < connectionTimeout,
+                $"The excess connection was not rejected promptly: {stopwatch.Elapsed}.");
+
+            var buffer = new byte[1];
+            var bytesRead = await stalledClient.GetStream().ReadAsync(buffer, cancellation.Token);
+            Assert.Equal(0, bytesRead);
+
+            var response = await SendAsync(
+                port,
+                new FrameRequest(CommandType.Set, "limited", "connection"),
+                cancellation.Token);
+            Assert.Equal(new FrameResponse(ResultType.Success, "limited"), response);
         }
         finally
         {
