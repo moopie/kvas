@@ -1,14 +1,13 @@
+using System.Collections.Concurrent;
 using server.Interfaces;
 
 namespace server;
 
 public sealed class CacheStore : ICacheStore
 {
-    private readonly SemaphoreSlim _semaphore = new(1, 1);
-    
-    private readonly Dictionary<string, string> _dictionary = new();
+    private readonly ConcurrentDictionary<string, string> _dictionary = new();
 
-    public async Task SetAsync(string key, string value)
+    public Task SetAsync(string key, string value)
     {
         if (string.IsNullOrEmpty(key))
         {
@@ -20,52 +19,35 @@ public sealed class CacheStore : ICacheStore
             throw new ArgumentNullException(nameof(value));
         }
 
-        await _semaphore.WaitAsync();
-        try
-        {
-            _dictionary[key] = value;
-        }
-        finally
-        {
-            _semaphore.Release();
-        }
+        _dictionary[key] = value;
+        return Task.CompletedTask;
     }
 
-    public async Task<string> GetAsync(string key)
+    public Task<string> GetAsync(string key)
     {
         if (string.IsNullOrEmpty(key))
         {
             throw new ArgumentNullException(nameof(key));
         }
 
-        if (_dictionary.TryGetValue(key, out var value))
-        {
-            return await Task.FromResult(value);
-        }
-
-        return await Task.FromResult(string.Empty);
+        return Task.FromResult(
+            _dictionary.TryGetValue(key, out var value)
+                ? value
+                : string.Empty);
     }
 
-    public async Task RemoveAsync(string key)
+    public Task RemoveAsync(string key)
     {
         if (string.IsNullOrEmpty(key))
         {
             throw new ArgumentNullException(nameof(key));
         }
 
-        if (!_dictionary.ContainsKey(key))
+        if (!_dictionary.TryRemove(key, out _))
         {
             throw new KeyNotFoundException();
         }
 
-        await _semaphore.WaitAsync();
-        try
-        {
-            _dictionary.Remove(key);
-        }
-        finally
-        {
-            _semaphore.Release();
-        }
+        return Task.CompletedTask;
     }
 }
