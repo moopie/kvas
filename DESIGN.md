@@ -10,7 +10,11 @@ It consists of three commands:
 `SET <key> <value>`
 `DEL <key>`
 
-The server will return an empty value on a missing key, and willoverwrite a key if it already exists.
+TcpServer uses JSON with a message size encoded in the first block to safely transfer network data.
+
+The JSON data is stored in KV store as a string.
+
+The server will return an empty value on a missing key, and will overwrite a key if it already exists.
 
 # Replication details
 
@@ -19,15 +23,19 @@ to replicate.
 
 When replica starts it connects to said port and listens for SET/DEL events from primary.
 
-# Guarantess
+# Guarantees
 
-A client can reply for the data to be stored in the main server. Though the data will
-eventually propogate to the replicas, it is not immediate.
+A client can rely for the data to be stored in the main server. Though the data will
+eventually propagate to the replicas, it is not immediate.
 
 # Concurrency and backpressure
 
 `SET` and `DEL` can write only from a single thread.
 
 Connection pool is limited to 128 clients and a timeout of 2 seconds to limit pressure.
+Every event that is sent to a replica has a distinct id to not reapply events accidentally sent more than once.
 
+# Limitations
+
+There are no tests for when the primary server disconnects, only in case of replica disconnections.
 
