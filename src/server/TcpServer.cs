@@ -7,13 +7,15 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using server.Enums;
 using server.Interfaces;
+using server.Models;
 
 namespace server;
 
 public sealed class TcpServer : ITcpServer
 {
     public const int DefaultMaxConnections = 128;
-    public static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(2);
+
+    private static readonly TimeSpan DefaultConnectionTimeout = TimeSpan.FromSeconds(3);
 
     private readonly TcpListener _listener;
     private readonly TcpListener? _replicationListener;
@@ -24,8 +26,11 @@ public sealed class TcpServer : ITcpServer
     private readonly TimeSpan _connectionTimeout;
     private readonly ServerRole _role;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
-    private readonly ConcurrentDictionary<long, TcpClient> _replicas = new();
+    private readonly ConcurrentDictionary<long, ReplicaConnection> _replicas = new();
+    private readonly List<ReplicationEvent> _replicationEvents = [];
     private long _nextReplicaId;
+    private long _nextReplicationEventId;
+    private long _lastAppliedReplicationId;
     
     private const int HeaderSize = sizeof(int);
     private const int MaxFrameSize = 2 * 1024;
@@ -121,7 +126,7 @@ public sealed class TcpServer : ITcpServer
 
             foreach (var replica in _replicas.Values)
             {
-                replica.Dispose();
+                replica.Client.Dispose();
             }
 
             _replicas.Clear();
@@ -141,16 +146,24 @@ public sealed class TcpServer : ITcpServer
             {
                 using var primary = new TcpClient();
                 await primary.ConnectAsync(_replicationEndPoint!, stoppingToken);
+                var stream = primary.GetStream();
+                await WriteFrameAsync(
+                    stream,
+                    new ReplicationAck(_lastAppliedReplicationId),
+                    stoppingToken);
                 _logger.LogInformation(
                     "Replica on {EndPoint} connected to primary replication endpoint {PrimaryEndPoint}",
                     _listener.LocalEndpoint,
                     _replicationEndPoint);
 
-                var stream = primary.GetStream();
                 while (!stoppingToken.IsCancellationRequested)
                 {
-                    var request = await ReadFrameAsync(stream, stoppingToken);
-                    await ApplyReplicationEventAsync(request);
+                    var replicationEvent = await ReadFrameAsync<ReplicationEvent>(stream, stoppingToken);
+                    await ApplyReplicationEventAsync(replicationEvent);
+                    await WriteFrameAsync(
+                        stream,
+                        new ReplicationAck(_lastAppliedReplicationId),
+                        stoppingToken);
                 }
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
@@ -176,18 +189,33 @@ public sealed class TcpServer : ITcpServer
         }
     }
 
-    private async Task ApplyReplicationEventAsync(FrameRequest request)
+    private async Task ApplyReplicationEventAsync(ReplicationEvent replicationEvent)
     {
-        switch (request.Command)
+        if (replicationEvent.Id <= _lastAppliedReplicationId)
+        {
+            return;
+        }
+
+        if (replicationEvent.Id != _lastAppliedReplicationId + 1)
+        {
+            _logger.LogWarning(
+                "Replication gap detected on {EndPoint}. Expected {ExpectedId}, received {ReceivedId}",
+                _listener.LocalEndpoint,
+                _lastAppliedReplicationId + 1,
+                replicationEvent.Id);
+            return;
+        }
+
+        switch (replicationEvent.Command)
         {
             case CommandType.Set:
-                ArgumentException.ThrowIfNullOrEmpty(request.Value);
-                await _cacheStore.SetAsync(request.Key, request.Value);
+                ArgumentException.ThrowIfNullOrEmpty(replicationEvent.Value);
+                await _cacheStore.SetAsync(replicationEvent.Key, replicationEvent.Value);
                 break;
             case CommandType.Delete:
                 try
                 {
-                    await _cacheStore.RemoveAsync(request.Key);
+                    await _cacheStore.RemoveAsync(replicationEvent.Key);
                 }
                 catch (KeyNotFoundException)
                 {
@@ -196,8 +224,11 @@ public sealed class TcpServer : ITcpServer
                 break;
             default:
                 throw new InvalidDataException(
-                    $"Command {request.Command} is not a replication event.");
+                    $"Command {replicationEvent.Command} is not a replication event.");
         }
+
+        _replicationEvents.Add(replicationEvent);
+        _lastAppliedReplicationId = replicationEvent.Id;
     }
 
     private async Task AcceptReplicasAsync(CancellationToken stoppingToken)
@@ -208,11 +239,7 @@ public sealed class TcpServer : ITcpServer
             {
                 var replica = await _replicationListener!.AcceptTcpClientAsync(stoppingToken);
                 var replicaId = Interlocked.Increment(ref _nextReplicaId);
-                _replicas[replicaId] = replica;
-                _logger.LogInformation(
-                    "Replica {ReplicaId} connected from {RemoteEndPoint}",
-                    replicaId,
-                    replica.Client.RemoteEndPoint);
+                _ = HandleReplicaAsync(replicaId, replica, stoppingToken);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
@@ -224,6 +251,94 @@ public sealed class TcpServer : ITcpServer
                 {
                     _logger.LogError(e, "Error accepting replica connection");
                 }
+            }
+        }
+    }
+
+    private async Task HandleReplicaAsync(
+        long replicaId,
+        TcpClient client,
+        CancellationToken stoppingToken)
+    {
+        var connection = new ReplicaConnection(client);
+
+        try
+        {
+            var stream = client.GetStream();
+            using var handshakeTimeout = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            handshakeTimeout.CancelAfter(_connectionTimeout);
+            var initialAck = await ReadFrameAsync<ReplicationAck>(stream, handshakeTimeout.Token);
+
+            await _writeLock.WaitAsync(stoppingToken);
+            try
+            {
+                await ReplayMissingEventsAsync(connection, initialAck.LastAppliedId, stoppingToken);
+                _replicas[replicaId] = connection;
+            }
+            finally
+            {
+                _writeLock.Release();
+            }
+
+            _logger.LogInformation(
+                "Replica {ReplicaId} connected from {RemoteEndPoint} at event {LastAppliedId}",
+                replicaId,
+                client.Client.RemoteEndPoint,
+                initialAck.LastAppliedId);
+
+            while (!stoppingToken.IsCancellationRequested)
+            {
+                var ack = await ReadFrameAsync<ReplicationAck>(stream, stoppingToken);
+
+                await _writeLock.WaitAsync(stoppingToken);
+                try
+                {
+                    await ReplayMissingEventsAsync(connection, ack.LastAppliedId, stoppingToken);
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
+            }
+        }
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+        {
+        }
+        catch (Exception e)
+        {
+            if (!stoppingToken.IsCancellationRequested)
+            {
+                _logger.LogWarning(e, "Replica {ReplicaId} disconnected", replicaId);
+            }
+        }
+        finally
+        {
+            if (_replicas.TryGetValue(replicaId, out var registeredConnection)
+                && ReferenceEquals(connection, registeredConnection))
+            {
+                _replicas.TryRemove(replicaId, out _);
+            }
+
+            client.Dispose();
+        }
+    }
+
+    private async Task ReplayMissingEventsAsync(
+        ReplicaConnection connection,
+        long lastAppliedId,
+        CancellationToken token)
+    {
+        if (lastAppliedId < 0 || lastAppliedId > _nextReplicationEventId)
+        {
+            throw new InvalidDataException($"Invalid replication ACK: {lastAppliedId}.");
+        }
+
+        connection.LastAcknowledgedId = lastAppliedId;
+        foreach (var replicationEvent in _replicationEvents)
+        {
+            if (replicationEvent.Id > lastAppliedId)
+            {
+                await WriteFrameAsync(connection.Client.GetStream(), replicationEvent, token);
             }
         }
     }
@@ -244,7 +359,7 @@ public sealed class TcpServer : ITcpServer
             using (client)
             {
                 var stream = client.GetStream();
-                var request = await ReadFrameAsync(stream, timeout.Token);
+                var request = await ReadFrameAsync<FrameRequest>(stream, timeout.Token);
                 var response = await HandleRequest(request, timeout.Token);
                 _logger.LogInformation("[msg] {@Message}", request);
 
@@ -292,7 +407,8 @@ public sealed class TcpServer : ITcpServer
         try
         {
             await _cacheStore.RemoveAsync(request.Key);
-            await ReplicateWriteAsync(request, token);
+            var replicationEvent = RecordReplicationEvent(request);
+            await ReplicateWriteAsync(replicationEvent, token);
             return new FrameResponse(ResultType.Success, request.Key);
         }
         finally
@@ -310,7 +426,8 @@ public sealed class TcpServer : ITcpServer
         try
         {
             await _cacheStore.SetAsync(request.Key, request.Value);
-            await ReplicateWriteAsync(request, token);
+            var replicationEvent = RecordReplicationEvent(request);
+            await ReplicateWriteAsync(replicationEvent, token);
             return new FrameResponse(ResultType.Success, request.Key);
         }
         finally
@@ -319,19 +436,30 @@ public sealed class TcpServer : ITcpServer
         }
     }
 
-    private async Task ReplicateWriteAsync(FrameRequest request, CancellationToken token)
+    private ReplicationEvent RecordReplicationEvent(FrameRequest request)
+    {
+        var replicationEvent = new ReplicationEvent(
+            ++_nextReplicationEventId,
+            request.Command,
+            request.Key,
+            request.Value);
+        _replicationEvents.Add(replicationEvent);
+        return replicationEvent;
+    }
+
+    private async Task ReplicateWriteAsync(ReplicationEvent replicationEvent, CancellationToken token)
     {
         foreach (var (replicaId, replica) in _replicas)
         {
             try
             {
-                await WriteFrameAsync(replica.GetStream(), request, token);
+                await WriteFrameAsync(replica.Client.GetStream(), replicationEvent, token);
             }
             catch (Exception e) when (e is IOException or SocketException or ObjectDisposedException)
             {
                 if (_replicas.TryRemove(replicaId, out var disconnectedReplica))
                 {
-                    disconnectedReplica.Dispose();
+                    disconnectedReplica.Client.Dispose();
                 }
 
                 _logger.LogWarning(e, "Replica {ReplicaId} disconnected", replicaId);
@@ -351,7 +479,7 @@ public sealed class TcpServer : ITcpServer
     }
 
 
-    private static async Task<FrameRequest> ReadFrameAsync(NetworkStream stream, CancellationToken token)
+    private static async Task<T> ReadFrameAsync<T>(NetworkStream stream, CancellationToken token)
     {
         // Add content size header to track the length of network data
         var header = new byte[HeaderSize];
@@ -368,7 +496,7 @@ public sealed class TcpServer : ITcpServer
         var buffer = new byte[payloadLength];
         await stream.ReadExactlyAsync(buffer, token);
         var msg = Encoding.UTF8.GetString(buffer);
-        var payload = JsonSerializer.Deserialize<FrameRequest>(msg, JsonOptions);
+        var payload = JsonSerializer.Deserialize<T>(msg, JsonOptions);
         return payload ?? throw new IOException($"Invalid frame: {msg}");
     }
 
@@ -386,4 +514,5 @@ public sealed class TcpServer : ITcpServer
         await stream.WriteAsync(header, token);
         await stream.WriteAsync(payload, token);
     }
+
 }

@@ -123,6 +123,71 @@ public class ReplicationTests
         }
     }
 
+    [Fact]
+    public async Task Replica_ReconnectsAndReplaysMissedSetAndDeleteEvents()
+    {
+        var ports = GetAvailablePorts(3);
+        var replicationEndPoint = new IPEndPoint(IPAddress.Loopback, ports[2]);
+        var primary = CreateServer(ports[0], ServerRole.Primary, replicationEndPoint);
+        var replica = CreateServer(ports[1], ServerRole.Replica, replicationEndPoint);
+        using var primaryCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var replicaCancellation = new CancellationTokenSource();
+        using var resumedReplicaCancellation = new CancellationTokenSource();
+        var primaryTask = primary.Start(primaryCancellation.Token);
+        var replicaTask = replica.Start(replicaCancellation.Token);
+        Task? resumedReplicaTask = null;
+
+        try
+        {
+            await SendAsync(
+                ports[0],
+                new FrameRequest(CommandType.Set, "delete-after-reconnect", "value"),
+                primaryCancellation.Token);
+            await WaitForValueAsync(
+                ports[1],
+                "delete-after-reconnect",
+                "value",
+                primaryCancellation.Token);
+
+            await replicaCancellation.CancelAsync();
+            await replicaTask;
+
+            await SendAsync(
+                ports[0],
+                new FrameRequest(CommandType.Set, "set-while-disconnected", "replayed"),
+                primaryCancellation.Token);
+            await SendAsync(
+                ports[0],
+                new FrameRequest(CommandType.Delete, "delete-after-reconnect", null),
+                primaryCancellation.Token);
+
+            resumedReplicaTask = replica.Start(resumedReplicaCancellation.Token);
+
+            await WaitForValueAsync(
+                ports[1],
+                "set-while-disconnected",
+                "replayed",
+                primaryCancellation.Token);
+            await WaitForValueAsync(
+                ports[1],
+                "delete-after-reconnect",
+                string.Empty,
+                primaryCancellation.Token);
+        }
+        finally
+        {
+            await resumedReplicaCancellation.CancelAsync();
+            await primaryCancellation.CancelAsync();
+
+            if (resumedReplicaTask is not null)
+            {
+                await resumedReplicaTask;
+            }
+
+            await primaryTask;
+        }
+    }
+
     private static (TcpServer[] Servers, Task[] ServerTasks) StartCluster(
         IReadOnlyList<int> ports,
         CancellationToken cancellationToken)
