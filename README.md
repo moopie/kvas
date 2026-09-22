@@ -4,7 +4,7 @@ A key-value store with replication capabilities.
 
 ## System requirements
 
-1. .NET 10 SDK
+- .NET 10 SDK
 
 ## Launch the application
 
